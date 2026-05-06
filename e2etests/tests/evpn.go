@@ -3,11 +3,7 @@
 package tests
 
 import (
-	_ "embed"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,12 +27,6 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-//go:embed testdata/evpn-setup.sh
-var evpnSetupScript string
-
-//go:embed testdata/evpn-node-setup.sh
-var evpnNodeSetupScript string
-
 const (
 	evpnL2VNI      = 1000
 	evpnL2VLANID   = 100
@@ -46,8 +36,26 @@ const (
 	evpnBridge     = "evpnbr"
 	evpnVxlan      = "evpnvx"
 	evpnL3VRFTable = 10
-	evpnL2Iface = "evpnl2-100"
+	evpnL2Iface    = "evpnl2-100"
 )
+
+var evpnL2Config = infra.EVPNConfig{
+	L2VNI:    evpnL2VNI,
+	L2VLANID: evpnL2VLANID,
+	L2IPFmt:  "10.100.0.%d/24",
+	Bridge:   evpnBridge,
+	Vxlan:    evpnVxlan,
+}
+
+var evpnL3Config = infra.EVPNConfig{
+	L3VNI:       evpnL3VNI,
+	L3VLANID:    evpnL3VLANID,
+	L3VRF:       evpnL3VRF,
+	L3VRFTable:  evpnL3VRFTable,
+	L3PrefixFmt: "10.200.%d.1/24",
+	Bridge:      evpnBridge,
+	Vxlan:       evpnVxlan,
+}
 
 var _ = ginkgo.Describe("EVPN IPV4", func() {
 	var cs clientset.Interface
@@ -104,7 +112,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 
 		ginkgo.AfterEach(func() {
 			if externalFRR != nil {
-				err := runEVPNSetupScript(nodes, externalFRR, true, false, true)
+				err := infra.CleanupEVPN(cs, nodes, externalFRR, evpnL2Config)
 				if err != nil {
 					ginkgo.GinkgoWriter.Printf("EVPN cleanup error: %v\n", err)
 				}
@@ -150,7 +158,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 
 			ginkgo.By("Validating L2 data path from external FRR to nodes")
 			for nodeIdx := range nodes {
-				nodeIP := fmt.Sprintf("10.100.0.%d", nodeIdx+1)
+				nodeIP := evpnL2Config.L2IP(nodeIdx + 1)
 				Eventually(func() error {
 					return ping(externalFRR, nodeIP)
 				}, 30*time.Second, time.Second).ShouldNot(HaveOccurred(),
@@ -164,7 +172,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Setting up EVPN networking on nodes and external FRR")
-			err = runEVPNSetupScript(nodes, externalFRR, true, false, false)
+			err = infra.SetupEVPN(cs, nodes, externalFRR, evpnL2Config)
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Building FRRConfiguration with EVPN L2 VNI")
@@ -221,7 +229,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Setting up EVPN networking on nodes and external FRR")
-			err = runEVPNSetupScript(nodes, externalFRR, true, false, false)
+			err = infra.SetupEVPN(cs, nodes, externalFRR, evpnL2Config)
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Building split FRRConfigurations: one with local ASN RT, one with external ASN RT")
@@ -323,7 +331,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 
 		ginkgo.AfterEach(func() {
 			if externalFRR != nil {
-				err := runEVPNSetupScript(nodes, externalFRR, false, true, true)
+				err := infra.CleanupEVPN(cs, nodes, externalFRR, evpnL3Config)
 				if err != nil {
 					ginkgo.GinkgoWriter.Printf("EVPN cleanup error: %v\n", err)
 				}
@@ -351,7 +359,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 			ginkgo.By("Validating EVPN type-5 routes are received on external FRR")
 			expectedRoutes := map[string]string{}
 			for nodeIdx, node := range nodes {
-				prefix := fmt.Sprintf("10.200.%d.0/24", nodeIdx+1)
+				prefix := evpnL3Config.L3Prefix(nodeIdx + 1)
 				for _, addr := range node.Status.Addresses {
 					if addr.Type == corev1.NodeInternalIP && !strings.Contains(addr.Address, ":") {
 						expectedRoutes[prefix] = addr.Address
@@ -366,7 +374,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 
 			ginkgo.By("Validating L3 data path from external FRR to nodes via VRF")
 			for nodeIdx := range nodes {
-				nodeIP := fmt.Sprintf("10.200.%d.1", nodeIdx+1)
+				nodeIP := evpnL3Config.L3PrefixIP(nodeIdx + 1)
 				Eventually(func() error {
 					return pingVRF(externalFRR, evpnL3VRF, nodeIP)
 				}, 30*time.Second, time.Second).ShouldNot(HaveOccurred(),
@@ -379,7 +387,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 		l3VNIConfigs := func(neighbors []frrk8sv1beta1.Neighbor, externalFRR *frrcontainer.FRR, nodes []corev1.Node) []frrk8sv1beta1.FRRConfiguration {
 			var cfgs []frrk8sv1beta1.FRRConfiguration
 			for nodeIdx, node := range nodes {
-				prefix := fmt.Sprintf("10.200.%d.0/24", nodeIdx+1)
+				prefix := evpnL3Config.L3Prefix(nodeIdx + 1)
 				cfgs = append(cfgs, frrk8sv1beta1.FRRConfiguration{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      fmt.Sprintf("test-evpn-l3-%s", node.Name),
@@ -433,7 +441,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Setting up EVPN networking with L3 VNI")
-			err = runEVPNSetupScript(nodes, externalFRR, false, true, false)
+			err = infra.SetupEVPN(cs, nodes, externalFRR, evpnL3Config)
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Building FRRConfigurations with EVPN L3 VNI")
@@ -457,7 +465,7 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Setting up EVPN networking with L3 VNI")
-			err = runEVPNSetupScript(nodes, externalFRR, false, true, false)
+			err = infra.SetupEVPN(cs, nodes, externalFRR, evpnL3Config)
 			Expect(err).NotTo(HaveOccurred())
 
 			ginkgo.By("Building split FRRConfigurations: default-VRF router and VRF router separately")
@@ -507,71 +515,6 @@ var _ = ginkgo.Describe("EVPN IPV4", func() {
 		})
 	})
 })
-
-// runEVPNSetupScript runs evpn-setup.sh with the given parameters.
-// Both evpn-setup.sh and evpn-node-setup.sh are written to a temp directory
-// so evpn-setup.sh can locate and pipe evpn-node-setup.sh into containers.
-func runEVPNSetupScript(nodes []corev1.Node, externalFRR *frrcontainer.FRR, l2 bool, l3 bool, cleanup bool) error {
-	tmpDir, err := os.MkdirTemp("", "evpn-setup-*")
-	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	if err := os.WriteFile(filepath.Join(tmpDir, "evpn-setup.sh"), []byte(evpnSetupScript), 0755); err != nil {
-		return fmt.Errorf("writing evpn-setup.sh: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(tmpDir, "evpn-node-setup.sh"), []byte(evpnNodeSetupScript), 0755); err != nil {
-		return fmt.Errorf("writing evpn-node-setup.sh: %w", err)
-	}
-
-	nodeNames := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		nodeNames = append(nodeNames, n.Name)
-	}
-
-	env := []string{
-		fmt.Sprintf("EVPN_NODES=%s", strings.Join(nodeNames, " ")),
-		fmt.Sprintf("EVPN_EXTERNAL=%s", externalFRR.Name),
-		fmt.Sprintf("EVPN_EXTERNAL_ASN=%d", externalFRR.RouterConfig.ASN),
-		fmt.Sprintf("EVPN_FRR_K8S_ASN=%d", infra.FRRK8sASN),
-		fmt.Sprintf("CONTAINER_RUNTIME=%s", executor.ContainerRuntime),
-		fmt.Sprintf("EVPN_BRIDGE=%s", evpnBridge),
-		fmt.Sprintf("EVPN_VXLAN=%s", evpnVxlan),
-		fmt.Sprintf("FRRK8S_NAMESPACE=%s", k8s.FRRK8sNamespace),
-		fmt.Sprintf("FRRK8S_LABEL=%s", k8s.FRRK8sDaemonsetLS),
-		fmt.Sprintf("FRRK8S_CONTAINER=%s", k8s.FRRContainerName),
-	}
-
-	if l2 {
-		env = append(env,
-			fmt.Sprintf("EVPN_L2_VNI=%d", evpnL2VNI),
-			fmt.Sprintf("EVPN_L2_VLAN_ID=%d", evpnL2VLANID),
-		)
-	}
-
-	if l3 {
-		env = append(env,
-			fmt.Sprintf("EVPN_L3_VNI=%d", evpnL3VNI),
-			fmt.Sprintf("EVPN_L3_VLAN_ID=%d", evpnL3VLANID),
-			fmt.Sprintf("EVPN_L3_VRF=%s", evpnL3VRF),
-			fmt.Sprintf("EVPN_L3_VRF_TABLE=%d", evpnL3VRFTable),
-		)
-	}
-
-	if cleanup {
-		env = append(env, "EVPN_CLEANUP=true")
-	}
-
-	cmd := exec.Command("bash", filepath.Join(tmpDir, "evpn-setup.sh"))
-	cmd.Env = append(cmd.Environ(), env...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("evpn-setup.sh failed: %w\noutput: %s", err, string(out))
-	}
-	return nil
-}
-
 
 func expectedL2VNIRoutes(frrk8sPods []*corev1.Pod) (map[string]string, error) {
 	routes := make(map[string]string, len(frrk8sPods))
